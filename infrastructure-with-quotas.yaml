@@ -1,0 +1,1015 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: 'Hybrid Solution: Server-Side Logging + CCWB Quota Enforcement'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: bedrock-hybrid-tracking
+    Description: Project name for resource naming
+
+  AlertEmail:
+    Type: String
+    Description: Email address for CloudWatch alarms
+    Default: admin@example.com
+
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues:
+      - development
+      - staging
+      - production
+    Description: Environment name
+
+Resources:
+  # ============================================================================
+  # KMS Key for Encryption
+  # ============================================================================
+  EncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS key for Bedrock logging and quota tracking encryption
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+
+          - Sid: Allow CloudWatch Logs
+            Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - 'kms:Encrypt'
+              - 'kms:Decrypt'
+              - 'kms:ReEncrypt*'
+              - 'kms:GenerateDataKey*'
+              - 'kms:CreateGrant'
+              - 'kms:DescribeKey'
+            Resource: '*'
+            Condition:
+              ArnLike:
+                'kms:EncryptionContext:aws:logs:arn': !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+
+          - Sid: Allow Bedrock Service
+            Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action:
+              - 'kms:Decrypt'
+              - 'kms:GenerateDataKey'
+            Resource: '*'
+
+          - Sid: Allow Glue
+            Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action:
+              - 'kms:Decrypt'
+              - 'kms:DescribeKey'
+            Resource: '*'
+
+          - Sid: Allow Athena
+            Effect: Allow
+            Principal:
+              Service: athena.amazonaws.com
+            Action:
+              - 'kms:Decrypt'
+              - 'kms:GenerateDataKey'
+            Resource: '*'
+
+          - Sid: Allow DynamoDB
+            Effect: Allow
+            Principal:
+              Service: dynamodb.amazonaws.com
+            Action:
+              - 'kms:Decrypt'
+              - 'kms:GenerateDataKey'
+              - 'kms:CreateGrant'
+            Resource: '*'
+
+  EncryptionKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${ProjectName}-key'
+      TargetKeyId: !Ref EncryptionKey
+
+  # ============================================================================
+  # S3 Bucket for Bedrock Invocation Logs
+  # ============================================================================
+  InvocationLogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-logs-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'aws:kms'
+              KMSMasterKeyID: !GetAtt EncryptionKey.Arn
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIA
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogsBucket
+        LogFilePrefix: invocation-logs/
+
+  AccessLogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-access-logs-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'aws:kms'
+              KMSMasterKeyID: !GetAtt EncryptionKey.Arn
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  AthenaResultsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-athena-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'aws:kms'
+              KMSMasterKeyID: !GetAtt EncryptionKey.Arn
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldResults
+            Status: Enabled
+            ExpirationInDays: 30
+
+  # ============================================================================
+  # CloudWatch Log Group for Bedrock
+  # ============================================================================
+  BedrockLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/bedrock/modelinvocations
+      RetentionInDays: 30
+      KmsKeyId: !GetAtt EncryptionKey.Arn
+
+  # ============================================================================
+  # DynamoDB Tables for Quota Management (CCWB Integration)
+  # ============================================================================
+
+  # Table 1: User Metadata (with limits)
+  UserMetadataTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-UserMetadata'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref EncryptionKey
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-UserMetadata'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Table 2: Quota Policies
+  QuotaPoliciesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-QuotaPolicies'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: policy_type
+          AttributeType: S
+        - AttributeName: identifier
+          AttributeType: S
+      KeySchema:
+        - AttributeName: policy_type
+          KeyType: HASH
+        - AttributeName: identifier
+          KeyType: RANGE
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref EncryptionKey
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-QuotaPolicies'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Table 3: Real-time Usage Tracking
+  UserQuotaMetricsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-UserQuotaMetrics'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: user_email
+          AttributeType: S
+        - AttributeName: metric_period
+          AttributeType: S
+      KeySchema:
+        - AttributeName: user_email
+          KeyType: HASH
+        - AttributeName: metric_period
+          KeyType: RANGE
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref EncryptionKey
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-UserQuotaMetrics'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ============================================================================
+  # Glue Database and Crawler
+  # ============================================================================
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub '${ProjectName}_invocations'
+        Description: Database for Bedrock invocation logs
+
+  GlueCrawlerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-glue-crawler'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole'
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:PutObject'
+                  - 's3:ListBucket'
+                Resource:
+                  - !GetAtt InvocationLogsBucket.Arn
+                  - !Sub '${InvocationLogsBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - 'kms:Decrypt'
+                  - 'kms:DescribeKey'
+                Resource: !GetAtt EncryptionKey.Arn
+
+  GlueCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub '${ProjectName}-crawler'
+      Role: !GetAtt GlueCrawlerRole.Arn
+      DatabaseName: !Ref GlueDatabase
+      Schedule:
+        ScheduleExpression: 'cron(0 2 * * ? *)'  # Daily at 2 AM UTC
+      Targets:
+        S3Targets:
+          - Path: !Sub 's3://${InvocationLogsBucket}/invocations/'
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+      Configuration: |
+        {
+          "Version": 1.0,
+          "CrawlerOutput": {
+            "Partitions": {"AddOrUpdateBehavior": "InheritFromTable"}
+          }
+        }
+
+  # ============================================================================
+  # Athena Workgroup
+  # ============================================================================
+  AthenaWorkgroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub '${ProjectName}-workgroup'
+      Description: Workgroup for Bedrock usage queries
+      State: ENABLED
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: true
+        ResultConfigurationUpdates:
+          OutputLocation: !Sub 's3://${AthenaResultsBucket}/results/'
+          EncryptionConfiguration:
+            EncryptionOption: SSE_KMS
+            KmsKey: !GetAtt EncryptionKey.Arn
+        BytesScannedCutoffPerQuery: 10737418240  # 10 GB limit
+        PublishCloudWatchMetricsEnabled: true
+
+  # ============================================================================
+  # Lambda: Bedrock Proxy with Quota Enforcement
+  # ============================================================================
+  BedrockProxyRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-bedrock-proxy'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: BedrockAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'bedrock:InvokeModel'
+                  - 'bedrock:InvokeModelWithResponseStream'
+                Resource: !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/*'
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'dynamodb:GetItem'
+                  - 'dynamodb:PutItem'
+                  - 'dynamodb:UpdateItem'
+                  - 'dynamodb:Query'
+                Resource:
+                  - !GetAtt UserMetadataTable.Arn
+                  - !GetAtt QuotaPoliciesTable.Arn
+                  - !GetAtt UserQuotaMetricsTable.Arn
+              - Effect: Allow
+                Action:
+                  - 'kms:Decrypt'
+                  - 'kms:GenerateDataKey'
+                Resource: !GetAtt EncryptionKey.Arn
+        - PolicyName: CloudWatchMetrics
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'cloudwatch:PutMetricData'
+                Resource: '*'
+
+  BedrockProxyFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-bedrock-proxy'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt BedrockProxyRole.Arn
+      Timeout: 60
+      MemorySize: 512
+      Environment:
+        Variables:
+          USER_METADATA_TABLE: !Ref UserMetadataTable
+          QUOTA_POLICIES_TABLE: !Ref QuotaPoliciesTable
+          QUOTA_METRICS_TABLE: !Ref UserQuotaMetricsTable
+          ENVIRONMENT: !Ref Environment
+      InlineCode: |
+        import json
+        import boto3
+        import os
+        from datetime import datetime
+        from decimal import Decimal
+
+        # AWS clients
+        bedrock_runtime = boto3.client('bedrock-runtime')
+        dynamodb = boto3.resource('dynamodb')
+        cloudwatch = boto3.client('cloudwatch')
+
+        # DynamoDB tables
+        user_metadata_table = dynamodb.Table(os.environ['USER_METADATA_TABLE'])
+        quota_policies_table = dynamodb.Table(os.environ['QUOTA_POLICIES_TABLE'])
+        quota_metrics_table = dynamodb.Table(os.environ['QUOTA_METRICS_TABLE'])
+
+        def lambda_handler(event, context):
+            """
+            Hybrid Bedrock Proxy:
+            1. Validates JWT (done by API Gateway authorizer)
+            2. Checks quota BEFORE invoking Bedrock
+            3. Invokes Bedrock with server-side requestMetadata
+            4. Updates usage atomically AFTER success
+            5. Publishes CloudWatch metrics
+            """
+
+            try:
+                # Extract user identity from authorizer context
+                user_id = event['requestContext']['authorizer']['principalId']
+
+                # Get user metadata
+                user_metadata = get_user_metadata(user_id)
+                if not user_metadata:
+                    return error_response(404, f'User {user_id} not found')
+
+                # Get quota policies for this user
+                quota_policy = get_quota_policy(user_id, user_metadata)
+
+                # Check quota BEFORE invoking Bedrock
+                quota_check_result = check_quota(user_id, quota_policy)
+                if not quota_check_result['allowed']:
+                    return quota_exceeded_response(quota_check_result)
+
+                # Parse request body
+                body_str = event.get('body', '{}')
+                request_body = json.loads(body_str) if isinstance(body_str, str) else body_str
+
+                # Build Bedrock request
+                model_id = request_body.get('modelId', 'us.anthropic.claude-3-5-sonnet-20241022-v2:0')
+                messages = request_body.get('messages', [])
+                max_tokens = request_body.get('max_tokens', 100)
+
+                bedrock_body = json.dumps({
+                    "messages": messages,
+                    "max_tokens": max_tokens,
+                    "anthropic_version": "bedrock-2023-05-31"
+                })
+
+                # Build requestMetadata (SERVER-SIDE - cannot be spoofed!)
+                request_metadata = {
+                    'userId': user_id,
+                    'group': user_metadata.get('group', 'default'),
+                    'tenant': user_metadata.get('tenant', 'default'),
+                    'department': user_metadata.get('department', 'unknown'),
+                    'source': 'hybrid-gateway',
+                    'timestamp': datetime.now().isoformat(),
+                    'quotaEnabled': True,
+                    'monthlyLimit': int(quota_policy.get('monthly_limit', 0)),
+                    'dailyLimit': int(quota_policy.get('daily_limit', 0))
+                }
+
+                # Invoke Bedrock with server-side metadata
+                response = bedrock_runtime.invoke_model(
+                    modelId=model_id,
+                    body=bedrock_body,
+                    requestMetadata=request_metadata
+                )
+
+                # Parse response
+                response_body = json.loads(response['body'].read())
+                usage = response_body.get('usage', {})
+                input_tokens = usage.get('input_tokens', 0)
+                output_tokens = usage.get('output_tokens', 0)
+                total_tokens = input_tokens + output_tokens
+
+                # Update usage atomically (AFTER successful invocation)
+                update_usage(user_id, total_tokens)
+
+                # Publish CloudWatch metrics
+                publish_quota_metrics(user_id, user_metadata, quota_policy, total_tokens)
+
+                # Return success with usage info
+                return {
+                    'statusCode': 200,
+                    'headers': {
+                        'Content-Type': 'application/json',
+                        'Access-Control-Allow-Origin': '*'
+                    },
+                    'body': json.dumps({
+                        'content': response_body.get('content', []),
+                        'usage': {
+                            'input_tokens': input_tokens,
+                            'output_tokens': output_tokens,
+                            'total_tokens': total_tokens
+                        },
+                        'quota': {
+                            'monthly_limit': int(quota_policy.get('monthly_limit', 0)),
+                            'monthly_used': quota_check_result['monthly_usage'] + total_tokens,
+                            'monthly_remaining': int(quota_policy.get('monthly_limit', 0)) - quota_check_result['monthly_usage'] - total_tokens,
+                            'daily_limit': int(quota_policy.get('daily_limit', 0)),
+                            'daily_used': quota_check_result['daily_usage'] + total_tokens,
+                            'daily_remaining': int(quota_policy.get('daily_limit', 0)) - quota_check_result['daily_usage'] - total_tokens
+                        },
+                        'metadata': request_metadata
+                    })
+                }
+
+            except Exception as e:
+                print(f"Error: {str(e)}")
+                import traceback
+                traceback.print_exc()
+                return error_response(500, str(e))
+
+        def get_user_metadata(user_id):
+            """Get user metadata from DynamoDB"""
+            try:
+                response = user_metadata_table.get_item(Key={'userId': user_id})
+                return response.get('Item', {})
+            except Exception as e:
+                print(f"Error getting user metadata: {str(e)}")
+                return {}
+
+        def get_quota_policy(user_id, user_metadata):
+            """Get quota policy for user (checks user-specific, then group, then default)"""
+            try:
+                # Try user-specific policy first
+                response = quota_policies_table.get_item(
+                    Key={'policy_type': 'user', 'identifier': user_id}
+                )
+                if 'Item' in response:
+                    return response['Item']
+
+                # Try group policy
+                group = user_metadata.get('group', 'default')
+                response = quota_policies_table.get_item(
+                    Key={'policy_type': 'group', 'identifier': group}
+                )
+                if 'Item' in response:
+                    return response['Item']
+
+                # Fall back to default policy
+                response = quota_policies_table.get_item(
+                    Key={'policy_type': 'default', 'identifier': 'default'}
+                )
+                if 'Item' in response:
+                    return response['Item']
+
+                # No policy found - use hardcoded default
+                return {
+                    'monthly_limit': 100000000,  # 100M tokens
+                    'daily_limit': 5000000,      # 5M tokens
+                    'enforcement_mode': 'alert'
+                }
+
+            except Exception as e:
+                print(f"Error getting quota policy: {str(e)}")
+                return {
+                    'monthly_limit': 100000000,
+                    'daily_limit': 5000000,
+                    'enforcement_mode': 'alert'
+                }
+
+        def check_quota(user_id, quota_policy):
+            """Check if user has quota available"""
+            try:
+                now = datetime.now()
+                month_key = f"monthly_{now.strftime('%Y-%m')}"
+                day_key = f"daily_{now.strftime('%Y-%m-%d')}"
+
+                # Get current usage
+                monthly_usage = get_usage(user_id, month_key)
+                daily_usage = get_usage(user_id, day_key)
+
+                monthly_limit = int(quota_policy.get('monthly_limit', 0))
+                daily_limit = int(quota_policy.get('daily_limit', 0))
+                enforcement_mode = quota_policy.get('enforcement_mode', 'block')
+
+                # Check limits
+                monthly_exceeded = monthly_usage >= monthly_limit
+                daily_exceeded = daily_usage >= daily_limit
+
+                # Enforcement logic
+                if enforcement_mode == 'block':
+                    allowed = not (monthly_exceeded or daily_exceeded)
+                else:  # 'alert' mode - allow but warn
+                    allowed = True
+
+                return {
+                    'allowed': allowed,
+                    'monthly_usage': monthly_usage,
+                    'monthly_limit': monthly_limit,
+                    'monthly_exceeded': monthly_exceeded,
+                    'daily_usage': daily_usage,
+                    'daily_limit': daily_limit,
+                    'daily_exceeded': daily_exceeded,
+                    'enforcement_mode': enforcement_mode
+                }
+
+            except Exception as e:
+                print(f"Error checking quota: {str(e)}")
+                # On error, allow but log
+                return {'allowed': True, 'monthly_usage': 0, 'daily_usage': 0, 'error': str(e)}
+
+        def get_usage(user_id, metric_period):
+            """Get current usage for a metric period"""
+            try:
+                response = quota_metrics_table.get_item(
+                    Key={'user_email': user_id, 'metric_period': metric_period}
+                )
+                item = response.get('Item', {})
+                return int(item.get('tokens_used', 0))
+            except Exception as e:
+                print(f"Error getting usage: {str(e)}")
+                return 0
+
+        def update_usage(user_id, tokens):
+            """Atomically update usage counters"""
+            try:
+                now = datetime.now()
+                month_key = f"monthly_{now.strftime('%Y-%m')}"
+                day_key = f"daily_{now.strftime('%Y-%m-%d')}"
+                timestamp = now.isoformat()
+
+                # Update monthly
+                quota_metrics_table.update_item(
+                    Key={'user_email': user_id, 'metric_period': month_key},
+                    UpdateExpression='ADD tokens_used :tokens SET last_updated = :timestamp, #ttl = :ttl',
+                    ExpressionAttributeValues={
+                        ':tokens': tokens,
+                        ':timestamp': timestamp,
+                        ':ttl': int((now.replace(day=1, hour=0, minute=0, second=0).timestamp() + 60*60*24*60))  # 60 days from month start
+                    },
+                    ExpressionAttributeNames={
+                        '#ttl': 'ttl'
+                    }
+                )
+
+                # Update daily
+                quota_metrics_table.update_item(
+                    Key={'user_email': user_id, 'metric_period': day_key},
+                    UpdateExpression='ADD tokens_used :tokens SET last_updated = :timestamp, #ttl = :ttl',
+                    ExpressionAttributeValues={
+                        ':tokens': tokens,
+                        ':timestamp': timestamp,
+                        ':ttl': int((now.timestamp() + 60*60*24*7))  # 7 days TTL for daily metrics
+                    },
+                    ExpressionAttributeNames={
+                        '#ttl': 'ttl'
+                    }
+                )
+
+            except Exception as e:
+                print(f"Error updating usage: {str(e)}")
+
+        def publish_quota_metrics(user_id, user_metadata, quota_policy, tokens_used):
+            """Publish CloudWatch metrics for quota monitoring"""
+            try:
+                tenant = user_metadata.get('tenant', 'unknown')
+                now = datetime.now()
+                month_key = f"monthly_{now.strftime('%Y-%m')}"
+                day_key = f"daily_{now.strftime('%Y-%m-%d')}"
+
+                # Get current usage
+                monthly_usage = get_usage(user_id, month_key)
+                daily_usage = get_usage(user_id, day_key)
+
+                monthly_limit = int(quota_policy.get('monthly_limit', 1))
+                daily_limit = int(quota_policy.get('daily_limit', 1))
+
+                # Calculate percentages
+                monthly_pct = (monthly_usage / monthly_limit * 100) if monthly_limit > 0 else 0
+                daily_pct = (daily_usage / daily_limit * 100) if daily_limit > 0 else 0
+
+                # Publish metrics
+                cloudwatch.put_metric_data(
+                    Namespace='Bedrock/Quota',
+                    MetricData=[
+                        {
+                            'MetricName': 'MonthlyUsagePercent',
+                            'Value': monthly_pct,
+                            'Unit': 'Percent',
+                            'Dimensions': [
+                                {'Name': 'UserId', 'Value': user_id},
+                                {'Name': 'Tenant', 'Value': tenant}
+                            ]
+                        },
+                        {
+                            'MetricName': 'DailyUsagePercent',
+                            'Value': daily_pct,
+                            'Unit': 'Percent',
+                            'Dimensions': [
+                                {'Name': 'UserId', 'Value': user_id},
+                                {'Name': 'Tenant', 'Value': tenant}
+                            ]
+                        },
+                        {
+                            'MetricName': 'TokensUsed',
+                            'Value': tokens_used,
+                            'Unit': 'Count',
+                            'Dimensions': [
+                                {'Name': 'UserId', 'Value': user_id},
+                                {'Name': 'Tenant', 'Value': tenant}
+                            ]
+                        }
+                    ]
+                )
+
+            except Exception as e:
+                print(f"Error publishing metrics: {str(e)}")
+
+        def quota_exceeded_response(quota_check):
+            """Return 429 error when quota is exceeded"""
+            message = []
+            if quota_check.get('monthly_exceeded'):
+                message.append(f"Monthly quota exceeded ({quota_check['monthly_usage']}/{quota_check['monthly_limit']} tokens)")
+            if quota_check.get('daily_exceeded'):
+                message.append(f"Daily quota exceeded ({quota_check['daily_usage']}/{quota_check['daily_limit']} tokens)")
+
+            return {
+                'statusCode': 429,
+                'headers': {
+                    'Content-Type': 'application/json',
+                    'Retry-After': '3600',
+                    'Access-Control-Allow-Origin': '*'
+                },
+                'body': json.dumps({
+                    'error': 'Quota exceeded',
+                    'message': ' | '.join(message),
+                    'quota': {
+                        'monthly_used': quota_check['monthly_usage'],
+                        'monthly_limit': quota_check['monthly_limit'],
+                        'daily_used': quota_check['daily_usage'],
+                        'daily_limit': quota_check['daily_limit']
+                    }
+                })
+            }
+
+        def error_response(status_code, message):
+            """Return error response"""
+            return {
+                'statusCode': status_code,
+                'headers': {
+                    'Content-Type': 'application/json',
+                    'Access-Control-Allow-Origin': '*'
+                },
+                'body': json.dumps({'error': message})
+            }
+
+  BedrockProxyFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref BedrockProxyFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${BedrockApi}/*'
+
+  # ============================================================================
+  # Lambda Authorizer (JWT Validation)
+  # ============================================================================
+  AuthorizerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-authorizer'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+
+  AuthorizerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-authorizer'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt AuthorizerRole.Arn
+      Timeout: 10
+      InlineCode: |
+        import json
+
+        def lambda_handler(event, context):
+            """
+            JWT authorizer (demo version)
+            In production: use Cognito, Auth0, or validate JWT with PyJWT
+            """
+
+            # Extract token from Authorization header
+            token = event.get('authorizationToken', '')
+
+            # Demo: accept "Bearer demo-token-{userId}"
+            if token.startswith('Bearer demo-token-'):
+                user_id = token.replace('Bearer demo-token-', '')
+
+                # Return IAM policy
+                return {
+                    'principalId': user_id,
+                    'policyDocument': {
+                        'Version': '2012-10-17',
+                        'Statement': [{
+                            'Action': 'execute-api:Invoke',
+                            'Effect': 'Allow',
+                            'Resource': event['methodArn']
+                        }]
+                    },
+                    'context': {
+                        'userId': user_id
+                    }
+                }
+
+            # Invalid token
+            raise Exception('Unauthorized')
+
+  # ============================================================================
+  # API Gateway
+  # ============================================================================
+  BedrockApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub '${ProjectName}-api'
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins:
+          - '*'
+        AllowMethods:
+          - POST
+          - GET
+          - OPTIONS
+        AllowHeaders:
+          - '*'
+
+  BedrockApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref BedrockApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BedrockProxyFunction.Arn}/invocations'
+      PayloadFormatVersion: '2.0'
+
+  BedrockApiRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref BedrockApi
+      RouteKey: 'POST /invoke'
+      Target: !Sub 'integrations/${BedrockApiIntegration}'
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref BedrockApiAuthorizer
+
+  BedrockApiAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      ApiId: !Ref BedrockApi
+      AuthorizerType: REQUEST
+      AuthorizerUri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AuthorizerFunction.Arn}/invocations'
+      IdentitySource:
+        - '$request.header.Authorization'
+      Name: !Sub '${ProjectName}-jwt-authorizer'
+      AuthorizerPayloadFormatVersion: '1.0'
+      EnableSimpleResponses: false
+
+  BedrockApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref BedrockApi
+      StageName: prod
+      AutoDeploy: true
+
+  AuthorizerFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AuthorizerFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${BedrockApi}/*'
+
+  # ============================================================================
+  # SNS Topic for Alerts
+  # ============================================================================
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-alerts'
+      DisplayName: Bedrock Quota and Logging Alerts
+      Subscription:
+        - Endpoint: !Ref AlertEmail
+          Protocol: email
+      KmsMasterKeyId: !Ref EncryptionKey
+
+  # ============================================================================
+  # CloudWatch Alarms
+  # ============================================================================
+  HighQuotaUsageAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-high-quota-usage'
+      AlarmDescription: Alert when any user exceeds 80% of monthly quota
+      MetricName: MonthlyUsagePercent
+      Namespace: Bedrock/Quota
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref AlertTopic
+      TreatMissingData: notBreaching
+
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-lambda-errors'
+      AlarmDescription: Alert on Lambda function errors
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref BedrockProxyFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref AlertTopic
+      TreatMissingData: notBreaching
+
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !Sub 'https://${BedrockApi}.execute-api.${AWS::Region}.amazonaws.com/prod'
+    Export:
+      Name: !Sub '${ProjectName}-api-endpoint'
+
+  InvocationLogsBucket:
+    Description: S3 bucket for invocation logs
+    Value: !Ref InvocationLogsBucket
+    Export:
+      Name: !Sub '${ProjectName}-logs-bucket'
+
+  BedrockLogGroupArn:
+    Description: CloudWatch Log Group ARN
+    Value: !GetAtt BedrockLogGroup.Arn
+
+  GlueDatabaseName:
+    Description: Glue database name
+    Value: !Ref GlueDatabase
+
+  GlueCrawlerName:
+    Description: Glue crawler name
+    Value: !Ref GlueCrawler
+
+  AthenaWorkgroup:
+    Description: Athena workgroup name
+    Value: !Ref AthenaWorkgroup
+
+  UserMetadataTable:
+    Description: DynamoDB table for user metadata
+    Value: !Ref UserMetadataTable
+    Export:
+      Name: !Sub '${ProjectName}-user-metadata-table'
+
+  QuotaPoliciesTable:
+    Description: DynamoDB table for quota policies
+    Value: !Ref QuotaPoliciesTable
+    Export:
+      Name: !Sub '${ProjectName}-quota-policies-table'
+
+  UserQuotaMetricsTable:
+    Description: DynamoDB table for usage tracking
+    Value: !Ref UserQuotaMetricsTable
+    Export:
+      Name: !Sub '${ProjectName}-quota-metrics-table'
+
+  KMSKeyId:
+    Description: KMS key ID
+    Value: !Ref EncryptionKey
+    Export:
+      Name: !Sub '${ProjectName}-kms-key'
+
+  AlertTopicArn:
+    Description: SNS topic for alerts
+    Value: !Ref AlertTopic

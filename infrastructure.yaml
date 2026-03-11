@@ -1,0 +1,676 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: 'Server-Side Bedrock Usage Tracking - Complete Infrastructure'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: bedrock-server-side-tracking
+    Description: Project name for resource naming
+
+  AlertEmail:
+    Type: String
+    Description: Email address for CloudWatch alarms
+    Default: admin@example.com
+
+Resources:
+  # ============================================================================
+  # KMS Key for Encryption
+  # ============================================================================
+  EncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS key for Bedrock logging encryption
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+
+          - Sid: Allow CloudWatch Logs
+            Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - 'kms:Encrypt'
+              - 'kms:Decrypt'
+              - 'kms:ReEncrypt*'
+              - 'kms:GenerateDataKey*'
+              - 'kms:CreateGrant'
+              - 'kms:DescribeKey'
+            Resource: '*'
+            Condition:
+              ArnLike:
+                'kms:EncryptionContext:aws:logs:arn': !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+
+          - Sid: Allow Bedrock Service
+            Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action:
+              - 'kms:Decrypt'
+              - 'kms:GenerateDataKey'
+            Resource: '*'
+
+          - Sid: Allow Glue
+            Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action:
+              - 'kms:Decrypt'
+              - 'kms:DescribeKey'
+            Resource: '*'
+
+          - Sid: Allow Athena
+            Effect: Allow
+            Principal:
+              Service: athena.amazonaws.com
+            Action:
+              - 'kms:Decrypt'
+              - 'kms:GenerateDataKey'
+            Resource: '*'
+
+  EncryptionKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${ProjectName}-key'
+      TargetKeyId: !Ref EncryptionKey
+
+  # ============================================================================
+  # S3 Bucket for Bedrock Invocation Logs
+  # ============================================================================
+  InvocationLogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-logs-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'aws:kms'
+              KMSMasterKeyID: !GetAtt EncryptionKey.Arn
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIA
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+          - Id: TransitionToGlacier
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+          - Id: ExpireOldLogs
+            Status: Enabled
+            ExpirationInDays: 365
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogsBucket
+        LogFilePrefix: 'invocation-logs-access/'
+
+  InvocationLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref InvocationLogsBucket
+      PolicyDocument:
+        Statement:
+          - Sid: DenyUnencryptedObjectUploads
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:PutObject'
+            Resource: !Sub '${InvocationLogsBucket.Arn}/*'
+            Condition:
+              StringNotEquals:
+                's3:x-amz-server-side-encryption': 'aws:kms'
+
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt InvocationLogsBucket.Arn
+              - !Sub '${InvocationLogsBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+          - Sid: AllowBedrockLogging
+            Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action:
+              - 's3:PutObject'
+            Resource: !Sub '${InvocationLogsBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+
+  # S3 Bucket for Access Logs
+  AccessLogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-access-logs-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireAccessLogs
+            Status: Enabled
+            ExpirationInDays: 90
+
+  # ============================================================================
+  # CloudWatch Log Group for Bedrock
+  # ============================================================================
+  BedrockLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/bedrock/${ProjectName}'
+      RetentionInDays: 30
+      KmsKeyId: !GetAtt EncryptionKey.Arn
+
+  # IAM Role for Bedrock Logging
+  BedrockLoggingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-bedrock-logging'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/CloudWatchLogsFullAccess'
+      Policies:
+        - PolicyName: BedrockLoggingPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:PutObject'
+                  - 's3:GetObject'
+                Resource: !Sub '${InvocationLogsBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: !GetAtt BedrockLogGroup.Arn
+              - Effect: Allow
+                Action:
+                  - 'kms:Decrypt'
+                  - 'kms:GenerateDataKey'
+                Resource: !GetAtt EncryptionKey.Arn
+
+  # ============================================================================
+  # Glue Database and Crawler
+  # ============================================================================
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub '${ProjectName}_db'
+        Description: 'Database for Bedrock invocation logs'
+
+  GlueCrawlerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-glue-crawler'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole'
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:ListBucket'
+                Resource:
+                  - !GetAtt InvocationLogsBucket.Arn
+                  - !Sub '${InvocationLogsBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - 'kms:Decrypt'
+                  - 'kms:DescribeKey'
+                Resource: !GetAtt EncryptionKey.Arn
+
+  GlueCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub '${ProjectName}-crawler'
+      Role: !GetAtt GlueCrawlerRole.Arn
+      DatabaseName: !Ref GlueDatabase
+      Targets:
+        S3Targets:
+          - Path: !Sub 's3://${InvocationLogsBucket}/invocation-logs/'
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+      Schedule:
+        ScheduleExpression: 'cron(0 2 * * ? *)'  # Daily at 2 AM
+
+  # ============================================================================
+  # Athena Workgroup
+  # ============================================================================
+  AthenaResultsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-athena-results-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'aws:kms'
+              KMSMasterKeyID: !GetAtt EncryptionKey.Arn
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireQueryResults
+            Status: Enabled
+            ExpirationInDays: 30
+
+  AthenaWorkgroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub '${ProjectName}-workgroup'
+      Description: 'Workgroup for querying Bedrock invocation logs'
+      State: ENABLED
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: true
+        ResultConfiguration:
+          OutputLocation: !Sub 's3://${AthenaResultsBucket}/query-results/'
+          EncryptionConfiguration:
+            EncryptionOption: SSE_KMS
+            KmsKey: !GetAtt EncryptionKey.Arn
+        BytesScannedCutoffPerQuery: 10000000000  # 10 GB limit
+
+  # ============================================================================
+  # DynamoDB Table for User Metadata
+  # ============================================================================
+  UserMetadataTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-user-metadata'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref EncryptionKey
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-user-metadata'
+
+  # ============================================================================
+  # Lambda Function for Bedrock Proxy (with requestMetadata)
+  # ============================================================================
+  BedrockProxyRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-bedrock-proxy'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: BedrockAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'bedrock:InvokeModel'
+                  - 'bedrock:InvokeModelWithResponseStream'
+                Resource: !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/*'
+              - Effect: Allow
+                Action:
+                  - 'dynamodb:GetItem'
+                  - 'dynamodb:Query'
+                Resource: !GetAtt UserMetadataTable.Arn
+
+  BedrockProxyFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-bedrock-proxy'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt BedrockProxyRole.Arn
+      Timeout: 60
+      MemorySize: 512
+      Environment:
+        Variables:
+          USER_METADATA_TABLE: !Ref UserMetadataTable
+      InlineCode: |
+        import json
+        import boto3
+        import os
+        from datetime import datetime
+
+        bedrock_runtime = boto3.client('bedrock-runtime')
+        dynamodb = boto3.resource('dynamodb')
+
+        USER_METADATA_TABLE = os.environ['USER_METADATA_TABLE']
+        table = dynamodb.Table(USER_METADATA_TABLE)
+
+        def lambda_handler(event, context):
+            """
+            Bedrock Proxy that adds server-side requestMetadata
+
+            Expected event structure:
+            {
+                "userId": "john.doe",
+                "modelId": "anthropic.claude-sonnet-4-20250514-v1:0",
+                "prompt": "Hello, world!",
+                "maxTokens": 100
+            }
+            """
+
+            try:
+                # Extract user identity (already validated by API Gateway authorizer)
+                user_id = event.get('userId')
+                if not user_id:
+                    return {
+                        'statusCode': 400,
+                        'body': json.dumps({'error': 'userId is required'})
+                    }
+
+                # Get user metadata from DynamoDB
+                user_metadata = get_user_metadata(user_id)
+
+                # Build request body for Bedrock
+                model_id = event.get('modelId', 'anthropic.claude-sonnet-4-20250514-v1:0')
+                prompt = event.get('prompt', '')
+                max_tokens = event.get('maxTokens', 100)
+
+                body = json.dumps({
+                    "messages": [{
+                        "role": "user",
+                        "content": [{"type": "text", "text": prompt}]
+                    }],
+                    "max_tokens": max_tokens,
+                    "anthropic_version": "bedrock-2023-05-31"
+                })
+
+                # Build requestMetadata (SERVER-SIDE - user never touches this!)
+                request_metadata = {
+                    'userId': user_id,
+                    'group': user_metadata.get('group', 'default'),
+                    'tenant': user_metadata.get('tenant', 'default'),
+                    'department': user_metadata.get('department', 'unknown'),
+                    'source': 'server-side-gateway',
+                    'timestamp': datetime.now().isoformat()
+                }
+
+                # Call Bedrock with server-set metadata
+                response = bedrock_runtime.invoke_model(
+                    modelId=model_id,
+                    body=body,
+                    # This is the key - requestMetadata set by SERVER
+                    **({'requestMetadata': request_metadata} if request_metadata else {})
+                )
+
+                # Parse response
+                response_body = json.loads(response['body'].read())
+
+                # Return success
+                return {
+                    'statusCode': 200,
+                    'headers': {
+                        'Content-Type': 'application/json',
+                        'Access-Control-Allow-Origin': '*'
+                    },
+                    'body': json.dumps({
+                        'response': response_body['content'][0]['text'],
+                        'usage': response_body['usage'],
+                        'metadata': request_metadata
+                    })
+                }
+
+            except Exception as e:
+                print(f"Error: {str(e)}")
+                return {
+                    'statusCode': 500,
+                    'body': json.dumps({'error': str(e)})
+                }
+
+        def get_user_metadata(user_id):
+            """Get user metadata from DynamoDB"""
+            try:
+                response = table.get_item(Key={'userId': user_id})
+                return response.get('Item', {})
+            except Exception as e:
+                print(f"Error getting user metadata: {str(e)}")
+                return {}
+
+  # Lambda permission for API Gateway
+  BedrockProxyFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref BedrockProxyFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${BedrockApi}/*'
+
+  # ============================================================================
+  # Lambda Authorizer (JWT Validation)
+  # ============================================================================
+  AuthorizerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-authorizer'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+
+  AuthorizerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-authorizer'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt AuthorizerRole.Arn
+      Timeout: 10
+      InlineCode: |
+        import json
+        import base64
+
+        def lambda_handler(event, context):
+            """
+            Simple JWT authorizer (for demonstration)
+            In production, use Cognito or proper JWT validation with PyJWT
+            """
+
+            # Extract token from Authorization header
+            token = event.get('authorizationToken', '')
+
+            # For demo: accept "Bearer demo-token-{userId}"
+            # In production: validate JWT signature, expiration, etc.
+            if token.startswith('Bearer demo-token-'):
+                user_id = token.replace('Bearer demo-token-', '')
+
+                # Return IAM policy allowing access
+                return {
+                    'principalId': user_id,
+                    'policyDocument': {
+                        'Version': '2012-10-17',
+                        'Statement': [{
+                            'Action': 'execute-api:Invoke',
+                            'Effect': 'Allow',
+                            'Resource': event['methodArn']
+                        }]
+                    },
+                    'context': {
+                        'userId': user_id,
+                        'group': 'demo-group',
+                        'tenant': 'demo-tenant'
+                    }
+                }
+            else:
+                raise Exception('Unauthorized')
+
+  # ============================================================================
+  # API Gateway
+  # ============================================================================
+  BedrockApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub '${ProjectName}-api'
+      StageName: prod
+      Cors:
+        AllowMethods: "'POST, GET, OPTIONS'"
+        AllowHeaders: "'Content-Type,Authorization'"
+        AllowOrigin: "'*'"
+      Auth:
+        DefaultAuthorizer: JWTAuthorizer
+        Authorizers:
+          JWTAuthorizer:
+            FunctionArn: !GetAtt AuthorizerFunction.Arn
+            FunctionPayloadType: TOKEN
+            Identity:
+              Header: Authorization
+              ValidationExpression: 'Bearer .*'
+
+  BedrockApiResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref BedrockApi
+      ParentId: !GetAtt BedrockApi.RootResourceId
+      PathPart: 'invoke'
+
+  BedrockApiMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref BedrockApi
+      ResourceId: !Ref BedrockApiResource
+      HttpMethod: POST
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref AuthorizerFunction
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BedrockProxyFunction.Arn}/invocations'
+
+  # ============================================================================
+  # SNS Topic for Alerts
+  # ============================================================================
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-alerts'
+      DisplayName: 'Bedrock Server-Side Tracking Alerts'
+      KmsMasterKeyId: !Ref EncryptionKey
+      Subscription:
+        - Endpoint: !Ref AlertEmail
+          Protocol: email
+
+Outputs:
+  InvocationLogsBucket:
+    Description: S3 bucket for Bedrock invocation logs
+    Value: !Ref InvocationLogsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-InvocationLogsBucket'
+
+  BedrockLogGroup:
+    Description: CloudWatch Log Group for Bedrock
+    Value: !Ref BedrockLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-BedrockLogGroup'
+
+  BedrockLoggingRoleArn:
+    Description: IAM Role ARN for Bedrock logging
+    Value: !GetAtt BedrockLoggingRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-BedrockLoggingRoleArn'
+
+  GlueDatabase:
+    Description: Glue database name
+    Value: !Ref GlueDatabase
+    Export:
+      Name: !Sub '${AWS::StackName}-GlueDatabase'
+
+  GlueCrawler:
+    Description: Glue crawler name
+    Value: !Ref GlueCrawler
+    Export:
+      Name: !Sub '${AWS::StackName}-GlueCrawler'
+
+  AthenaWorkgroup:
+    Description: Athena workgroup name
+    Value: !Ref AthenaWorkgroup
+    Export:
+      Name: !Sub '${AWS::StackName}-AthenaWorkgroup'
+
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !Sub 'https://${BedrockApi}.execute-api.${AWS::Region}.amazonaws.com/prod/invoke'
+    Export:
+      Name: !Sub '${AWS::StackName}-ApiEndpoint'
+
+  BedrockProxyFunction:
+    Description: Lambda function for Bedrock proxy
+    Value: !Ref BedrockProxyFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-BedrockProxyFunction'
+
+  UserMetadataTable:
+    Description: DynamoDB table for user metadata
+    Value: !Ref UserMetadataTable
+    Export:
+      Name: !Sub '${AWS::StackName}-UserMetadataTable'
+
+  EncryptionKeyId:
+    Description: KMS key ID for encryption
+    Value: !Ref EncryptionKey
+    Export:
+      Name: !Sub '${AWS::StackName}-EncryptionKeyId'

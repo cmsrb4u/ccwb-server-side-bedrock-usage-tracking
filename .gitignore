@@ -1,0 +1,50 @@
+# AWS SAM
+.aws-sam/
+samconfig.toml
+
+# Stack outputs
+stack-outputs*.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.venv/
+venv/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+deploy-output.log
+
+# Temporary files
+*.tmp
+*.bak
+
+# Credentials (NEVER commit!)
+*.pem
+*.key
+credentials
+.env
+.env.local
+
+# CloudFormation
+packaged.yaml
