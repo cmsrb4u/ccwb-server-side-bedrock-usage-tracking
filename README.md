@@ -27,19 +27,665 @@ This solution provides enterprise-grade monitoring and quota enforcement for Ama
 
 ## 🏗️ Architecture
 
+### High-Level Architecture
+
 ```
-Client (JWT Token)
+┌─────────────┐
+│   Client    │  JWT Token (user identity)
+│ Application │
+└──────┬──────┘
+       │
+       ↓ HTTPS Request
+┌─────────────────────────────────────────────────────────────────┐
+│                         API Gateway                              │
+│  ┌────────────────────────────────────────────────────────┐    │
+│  │  Custom JWT Authorizer (Lambda)                        │    │
+│  │  • Validates JWT signature                             │    │
+│  │  • Extracts user identity (email, tenant, group)       │    │
+│  │  • Returns IAM policy (Allow/Deny)                     │    │
+│  └────────────────────────────────────────────────────────┘    │
+└─────────┬───────────────────────────────────────────────────────┘
+          │
+          ↓ Authorized Request
+┌─────────────────────────────────────────────────────────────────┐
+│                  Lambda Proxy Function                           │
+│  ┌────────────────────────────────────────────────────────┐    │
+│  │  1. Get User Metadata        ← DynamoDB                │    │
+│  │  2. Get Quota Policy         ← DynamoDB                │    │
+│  │  3. Check Current Usage      ← DynamoDB                │    │
+│  │  4. Enforce Quota (PRE-REQUEST BLOCKING)               │    │
+│  │  5. Build requestMetadata (server-side, secure)        │    │
+│  │  6. Invoke Bedrock API       → Bedrock                 │    │
+│  │  7. Update Usage (Atomic)    → DynamoDB                │    │
+│  │  8. Publish Metrics          → CloudWatch              │    │
+│  │  9. Return Response to Client                          │    │
+│  └────────────────────────────────────────────────────────┘    │
+└─────────┬───────────────────────────────────────────────────────┘
+          │
+          ↓ Bedrock Invocation
+┌─────────────────────────────────────────────────────────────────┐
+│                   Amazon Bedrock                                 │
+│  ┌────────────────────────────────────────────────────────┐    │
+│  │  Application Inference Profile (AIP)                   │    │
+│  │  • Tenant A (Marketing):   arn:...p24qm5pye2qr         │    │
+│  │  • Tenant B (Sales):       arn:...3rg09c3irrs6         │    │
+│  │  • Tenant C (Engineering): arn:...iq5vx6jibn89         │    │
+│  │  • Tenant D (Finance):     arn:...f8a6a2e836bz         │    │
+│  │                                                         │    │
+│  │  Each AIP provides:                                    │    │
+│  │  ✓ Isolated CloudWatch metrics (AWS/Bedrock)           │    │
+│  │  ✓ Model invocation logging with requestMetadata      │    │
+│  │  ✓ Cost allocation via tags                            │    │
+│  └────────────────────────────────────────────────────────┘    │
+└─────────┬───────────────────────────────────────────────────────┘
+          │
+          ↓ Logs & Metrics
+┌─────────────────────────────────────────────────────────────────┐
+│                    Observability Layer                           │
+│                                                                   │
+│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐      │
+│  │  CloudWatch  │    │  CloudWatch  │    │      S3      │      │
+│  │    Metrics   │    │     Logs     │    │   (Logging)  │      │
+│  │              │    │              │    │              │      │
+│  │ • Invocations│───→│  Log Stream  │───→│  Invocation  │      │
+│  │ • TokenCount │    │  (1-2 min)   │    │  Logs JSON   │      │
+│  │ • Latency    │    │              │    │  (5-10 min)  │      │
+│  │ • Errors     │    │              │    │              │      │
+│  └──────────────┘    └──────────────┘    └──────┬───────┘      │
+│                                                   │              │
+│                                                   ↓              │
+│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐      │
+│  │     Glue     │───→│   Athena     │───→│    SQL       │      │
+│  │   Crawler    │    │   Queries    │    │  Analysis    │      │
+│  │  (Daily)     │    │              │    │  (Cost/User) │      │
+│  └──────────────┘    └──────────────┘    └──────────────┘      │
+└───────────────────────────────────────────────────────────────┘
+```
+
+### Component Breakdown
+
+#### 1. API Gateway Layer
+**Purpose:** Entry point for all requests, enforces authentication and authorization.
+
+**Components:**
+- **REST API Endpoint:** `https://{api-id}.execute-api.us-west-2.amazonaws.com/prod/invoke`
+- **Custom Authorizer Lambda:** Validates JWT tokens, extracts identity claims
+- **Usage Plans:** Rate limiting (optional)
+- **CloudWatch Logs:** Request/response logging
+
+**Security:**
+```json
+JWT Token (decoded):
+{
+  "sub": "john.doe@company.com",
+  "email": "john.doe@company.com",
+  "tenant": "tenant_a",
+  "group": "marketing",
+  "exp": 1709256000
+}
+```
+
+**Authorization Flow:**
+1. Client sends JWT in `Authorization: Bearer <token>` header
+2. API Gateway invokes Custom Authorizer Lambda
+3. Authorizer validates signature using public key/secret
+4. Authorizer returns IAM policy document (Allow/Deny)
+5. API Gateway caches policy for 5 minutes (TTL)
+6. Request forwarded to Lambda Proxy with identity context
+
+#### 2. Lambda Proxy Function
+**Purpose:** Core orchestration layer - enforces quotas, sets requestMetadata, invokes Bedrock.
+
+**Environment Variables:**
+```bash
+USER_METADATA_TABLE=UserMetadataTable
+QUOTA_POLICIES_TABLE=QuotaPoliciesTable
+USER_QUOTA_METRICS_TABLE=UserQuotaMetricsTable
+REGION=us-west-2
+```
+
+**Detailed Execution Flow:**
+
+```python
+# Step 1: Extract User Identity from Authorizer Context
+user_email = event['requestContext']['authorizer']['principalId']
+tenant = event['requestContext']['authorizer']['tenant']
+group = event['requestContext']['authorizer']['group']
+
+# Step 2: Get User Metadata from DynamoDB
+user_metadata = dynamodb.get_item(
+    TableName='UserMetadataTable',
+    Key={'userId': user_email}
+)
+# Contains: tenant mapping, group, monthly_limit, daily_limit
+
+# Step 3: Get Hierarchical Quota Policy
+# Priority: user > group > default
+quota_policy = get_quota_policy(user_email, group)
+# {
+#   "monthly_limit": 500000000,  # 500M tokens
+#   "daily_limit": 20000000,     # 20M tokens
+#   "enforcement_mode": "block"   # or "alert"
+# }
+
+# Step 4: Check Current Usage (DynamoDB)
+now = datetime.utcnow()
+month_key = f"monthly_{now.strftime('%Y-%m')}"
+day_key = f"daily_{now.strftime('%Y-%m-%d')}"
+
+monthly_usage = get_usage(user_email, month_key)
+daily_usage = get_usage(user_email, day_key)
+
+# Step 5: PRE-REQUEST QUOTA ENFORCEMENT
+if enforcement_mode == "block":
+    if monthly_usage >= monthly_limit:
+        raise QuotaExceededError("Monthly quota exceeded")
+    if daily_usage >= daily_limit:
+        raise QuotaExceededError("Daily quota exceeded")
+
+# Step 6: Build requestMetadata (SERVER-SIDE - CANNOT BE SPOOFED)
+request_metadata = {
+    "userId": user_email,
+    "tenant": tenant,
+    "group": group,
+    "requestId": str(uuid.uuid4()),
+    "timestamp": now.isoformat(),
+    "quotaStatus": {
+        "monthlyUsed": monthly_usage,
+        "monthlyLimit": monthly_limit,
+        "dailyUsed": daily_usage,
+        "dailyLimit": daily_limit
+    }
+}
+
+# Step 7: Invoke Bedrock with Application Inference Profile
+profile_arn = get_profile_arn(tenant)  # Map tenant → AIP ARN
+response = bedrock_runtime.invoke_model(
+    modelId=profile_arn,  # e.g., arn:aws:bedrock:us-west-2:123456789012:application-inference-profile/p24qm5pye2qr
+    body=json.dumps(bedrock_request),
+    accept='application/json',
+    contentType='application/json'
+)
+
+# Step 8: Parse Response & Calculate Token Usage
+response_body = json.loads(response['body'].read())
+input_tokens = response_body['usage']['input_tokens']
+output_tokens = response_body['usage']['output_tokens']
+total_tokens = input_tokens + output_tokens
+
+# Step 9: Update Usage ATOMICALLY (DynamoDB)
+# Using ADD operation for thread-safety
+dynamodb.update_item(
+    TableName='UserQuotaMetricsTable',
+    Key={
+        'user_email': user_email,
+        'metric_period': month_key
+    },
+    UpdateExpression='ADD tokens_used :tokens SET last_updated = :now',
+    ExpressionAttributeValues={
+        ':tokens': total_tokens,
+        ':now': now.isoformat()
+    }
+)
+
+# Same for daily usage
+dynamodb.update_item(
+    TableName='UserQuotaMetricsTable',
+    Key={
+        'user_email': user_email,
+        'metric_period': day_key
+    },
+    UpdateExpression='ADD tokens_used :tokens SET last_updated = :now',
+    ExpressionAttributeValues={
+        ':tokens': total_tokens,
+        ':now': now.isoformat()
+    }
+)
+
+# Step 10: Publish CloudWatch Metrics
+cloudwatch.put_metric_data(
+    Namespace='CCWB/UserQuota',
+    MetricData=[
+        {
+            'MetricName': 'MonthlyUsagePercent',
+            'Value': (monthly_usage + total_tokens) / monthly_limit * 100,
+            'Unit': 'Percent',
+            'Dimensions': [
+                {'Name': 'UserEmail', 'Value': user_email},
+                {'Name': 'Tenant', 'Value': tenant}
+            ]
+        },
+        {
+            'MetricName': 'DailyUsagePercent',
+            'Value': (daily_usage + total_tokens) / daily_limit * 100,
+            'Unit': 'Percent',
+            'Dimensions': [
+                {'Name': 'UserEmail', 'Value': user_email},
+                {'Name': 'Tenant', 'Value': tenant}
+            ]
+        }
+    ]
+)
+
+# Step 11: Return Response to Client
+return {
+    'statusCode': 200,
+    'body': json.dumps({
+        'response': response_body['content'][0]['text'],
+        'usage': {
+            'inputTokens': input_tokens,
+            'outputTokens': output_tokens,
+            'totalTokens': total_tokens
+        },
+        'quotaRemaining': {
+            'monthly': monthly_limit - (monthly_usage + total_tokens),
+            'daily': daily_limit - (daily_usage + total_tokens)
+        }
+    })
+}
+```
+
+**Key Design Decisions:**
+- **Pre-request blocking:** Checks quota BEFORE calling Bedrock (saves cost)
+- **Atomic operations:** Uses DynamoDB ADD for thread-safe increments
+- **Server-side metadata:** requestMetadata set by Lambda (cannot be spoofed)
+- **Hierarchical policies:** User → Group → Default (flexibility)
+
+#### 3. DynamoDB Tables
+
+**UserMetadataTable:**
+```json
+{
+  "userId": "john.doe@company.com",        // Partition Key
+  "tenant": "tenant_a",
+  "group": "marketing",
+  "created_at": "2026-03-01T00:00:00Z",
+  "status": "active"
+}
+```
+
+**QuotaPoliciesTable:**
+```json
+{
+  "policy_type": "user",                   // Partition Key (user|group|default)
+  "identifier": "john.doe@company.com",    // Sort Key
+  "monthly_limit": 500000000,              // 500M tokens
+  "daily_limit": 20000000,                 // 20M tokens
+  "enforcement_mode": "block",             // block|alert|log
+  "created_at": "2026-03-01T00:00:00Z",
+  "updated_at": "2026-03-10T15:30:00Z"
+}
+```
+
+**UserQuotaMetricsTable:**
+```json
+{
+  "user_email": "john.doe@company.com",    // Partition Key
+  "metric_period": "monthly_2026-03",      // Sort Key (monthly_YYYY-MM or daily_YYYY-MM-DD)
+  "tokens_used": 150000350,
+  "last_updated": "2026-03-11T04:00:00Z"
+}
+```
+
+**Query Patterns:**
+```python
+# Get user's monthly usage
+get_item(pk="john.doe@company.com", sk="monthly_2026-03")
+
+# Get user's daily usage
+get_item(pk="john.doe@company.com", sk="daily_2026-03-11")
+
+# Get all users' usage for a month
+query(pk="john.doe@company.com", sk_begins_with="monthly_")
+```
+
+#### 4. Bedrock Application Inference Profiles
+
+**Purpose:** Multi-tenant isolation at the model invocation level.
+
+**Configuration:**
+```yaml
+Tenant A (Marketing):
+  ProfileId: p24qm5pye2qr
+  Model: anthropic.claude-3-5-sonnet-20241022-v2:0
+  CloudWatch Dimension: ModelId=p24qm5pye2qr
+  Use Case: Content generation, social media drafts
+
+Tenant B (Sales):
+  ProfileId: 3rg09c3irrs6
+  Model: anthropic.claude-3-5-sonnet-20241022-v2:0
+  CloudWatch Dimension: ModelId=3rg09c3irrs6
+  Use Case: Email drafting, lead qualification
+
+Tenant C (Engineering):
+  ProfileId: iq5vx6jibn89
+  Model: anthropic.claude-3-5-sonnet-20241022-v2:0
+  CloudWatch Dimension: ModelId=iq5vx6jibn89
+  Use Case: Code reviews, documentation
+
+Tenant D (Finance):
+  ProfileId: f8a6a2e836bz
+  Model: anthropic.claude-3-5-sonnet-20241022-v2:0
+  CloudWatch Dimension: ModelId=f8a6a2e836bz
+  Use Case: Report generation, data analysis
+```
+
+**Benefits:**
+- **Isolated Metrics:** Each tenant gets separate CloudWatch metrics
+- **Cost Allocation:** Tag-based cost attribution in AWS Cost Explorer
+- **Rate Limiting:** Per-tenant throttling (if needed)
+- **Model Selection:** Different tenants can use different models
+- **Logging:** Separate invocation logs per tenant
+
+#### 5. CloudWatch Metrics
+
+**AWS/Bedrock Namespace (Automatic):**
+```python
+Metrics:
+  - Invocations (Count)
+  - InputTokenCount (Count)
+  - OutputTokenCount (Count)
+  - InvocationLatency (Milliseconds)
+  - ModelErrors (Count)
+
+Dimensions:
+  - ModelId: [AIP Profile ID]  # e.g., p24qm5pye2qr
+
+Time Granularity: 1 minute
+Retention: 15 months
+```
+
+**CCWB/UserQuota Namespace (Custom):**
+```python
+Metrics:
+  - MonthlyUsagePercent (Percent)
+  - DailyUsagePercent (Percent)
+
+Dimensions:
+  - UserEmail: [user email]
+  - Tenant: [tenant identifier]
+
+Published By: Lambda Proxy Function
+Time Granularity: Per request
+Retention: 15 months
+```
+
+**Dashboard Queries:**
+```python
+# Tenant invocations (last hour)
+SELECT SUM(Invocations)
+FROM "AWS/Bedrock"
+WHERE ModelId = 'p24qm5pye2qr'
+  AND time >= now() - 1h
+GROUP BY time(5m)
+
+# User quota percentage
+SELECT AVG(MonthlyUsagePercent)
+FROM "CCWB/UserQuota"
+WHERE UserEmail = 'john.doe@company.com'
+  AND time >= now() - 1h
+```
+
+#### 6. Logging & Audit Trail
+
+**Flow:**
+```
+Bedrock Invocation
+    ↓ (1-2 minutes)
+CloudWatch Log Stream: /aws/bedrock/modelinvocations
+    ↓ (5-10 minutes)
+S3 Bucket: bedrock-invocation-logs-{account}-{region}
+    ↓ (on-demand or scheduled)
+Glue Crawler: bedrock-logs-crawler (discovers schema)
     ↓
-API Gateway (JWT Validation)
+Glue Data Catalog: bedrock_invocation_logs database
     ↓
+Athena Workgroup: BedrockAnalytics
+    ↓
+SQL Queries: Cost attribution, usage analysis
+```
+
+**S3 Log Structure:**
+```
+s3://bedrock-invocation-logs-123456789012-us-west-2/
+├── year=2026/
+│   ├── month=03/
+│   │   ├── day=11/
+│   │   │   ├── hour=04/
+│   │   │   │   ├── invocation_1234567890.json
+│   │   │   │   ├── invocation_1234567891.json
+│   │   │   │   └── ...
+```
+
+**Log Entry Example:**
+```json
+{
+  "schemaType": "ModelInvocationLog",
+  "schemaVersion": "1.0",
+  "timestamp": "2026-03-11T04:15:23.456Z",
+  "accountId": "123456789012",
+  "identity": {
+    "arn": "arn:aws:sts::123456789012:assumed-role/BedrockProxyRole/BedrockProxyFunction"
+  },
+  "region": "us-west-2",
+  "requestId": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "operation": "InvokeModel",
+  "modelId": "arn:aws:bedrock:us-west-2:123456789012:application-inference-profile/p24qm5pye2qr",
+  "input": {
+    "inputContentType": "application/json",
+    "inputBodyJson": {
+      "anthropic_version": "bedrock-2023-05-31",
+      "messages": [{"role": "user", "content": "What is AI?"}],
+      "max_tokens": 1024
+    }
+  },
+  "output": {
+    "outputContentType": "application/json",
+    "outputBodyJson": {
+      "id": "msg_abc123",
+      "type": "message",
+      "role": "assistant",
+      "content": [{"type": "text", "text": "AI is..."}],
+      "usage": {
+        "input_tokens": 12,
+        "output_tokens": 56
+      }
+    }
+  },
+  "requestMetadata": {
+    "userId": "john.doe@company.com",
+    "tenant": "tenant_a",
+    "group": "marketing",
+    "requestId": "req-12345",
+    "timestamp": "2026-03-11T04:15:23.123Z",
+    "quotaStatus": {
+      "monthlyUsed": 150000000,
+      "monthlyLimit": 500000000,
+      "dailyUsed": 5000000,
+      "dailyLimit": 20000000
+    }
+  }
+}
+```
+
+**Athena SQL Queries:**
+```sql
+-- Cost per user (last 30 days)
+SELECT
+    json_extract_scalar(requestmetadata, '$.userId') AS user_email,
+    json_extract_scalar(requestmetadata, '$.tenant') AS tenant,
+    COUNT(*) AS invocations,
+    SUM(CAST(json_extract_scalar(output, '$.outputBodyJson.usage.input_tokens') AS INTEGER)) AS input_tokens,
+    SUM(CAST(json_extract_scalar(output, '$.outputBodyJson.usage.output_tokens') AS INTEGER)) AS output_tokens,
+    ROUND(
+        (SUM(CAST(json_extract_scalar(output, '$.outputBodyJson.usage.input_tokens') AS INTEGER)) * 3.00 / 1000000.0) +
+        (SUM(CAST(json_extract_scalar(output, '$.outputBodyJson.usage.output_tokens') AS INTEGER)) * 15.00 / 1000000.0),
+        4
+    ) AS estimated_cost_usd
+FROM invocations
+WHERE from_iso8601_timestamp(timestamp) >= current_date - interval '30' day
+GROUP BY
+    json_extract_scalar(requestmetadata, '$.userId'),
+    json_extract_scalar(requestmetadata, '$.tenant')
+ORDER BY estimated_cost_usd DESC;
+```
+
+#### 7. Security Architecture
+
+**Defense in Depth:**
+
+```
+Layer 1: Network Security
+├─ API Gateway: HTTPS only
+├─ Private VPC endpoints (optional)
+└─ WAF rules (optional)
+
+Layer 2: Authentication & Authorization
+├─ JWT signature validation
+├─ Token expiration checks
+├─ IAM policy generation
+└─ Least-privilege roles
+
+Layer 3: Application Security
+├─ Server-side requestMetadata (cannot be spoofed)
+├─ Input validation
+├─ Rate limiting
+└─ Error handling (no sensitive data in errors)
+
+Layer 4: Data Security
+├─ KMS encryption at rest (S3, DynamoDB, CloudWatch)
+├─ Encryption in transit (TLS 1.2+)
+├─ S3 bucket policies (deny unencrypted uploads)
+└─ DynamoDB point-in-time recovery
+
+Layer 5: Audit & Compliance
+├─ CloudTrail API logging
+├─ CloudWatch Logs (all requests)
+├─ S3 invocation logs (immutable)
+└─ Athena queries (compliance reports)
+```
+
+**Trust Model:**
+```
+TRUSTED:
+✓ API Gateway (AWS managed)
+✓ Lambda Authorizer (validates JWT)
+✓ Lambda Proxy (sets requestMetadata)
+✓ DynamoDB (atomic operations)
+✓ Bedrock (AWS managed)
+
+UNTRUSTED:
+✗ Client application (can send arbitrary JWT)
+✗ User input (validated at Lambda)
+✗ Client-provided metadata (ignored - server sets it)
+```
+
+#### 8. Cost Attribution Data Flow
+
+**Real-Time (DynamoDB):**
+```
 Lambda Proxy
-    ├─ Check Quota (DynamoDB)
-    ├─ Invoke Bedrock (with requestMetadata)
-    ├─ Update Usage (Atomic)
-    └─ Publish Metrics (CloudWatch)
+    ↓ (immediate)
+DynamoDB Update (ADD tokens_used)
+    ↓ (immediate)
+CloudWatch Metric (MonthlyUsagePercent)
+    ↓ (immediate)
+Dashboard Widget (Quota Gauge)
     ↓
-CloudWatch → S3 → Glue → Athena
+Alert (if > 80%)
 ```
+
+**Historical (Athena):**
+```
+Bedrock Invocation
+    ↓ (1-2 min)
+CloudWatch Log
+    ↓ (5-10 min)
+S3 JSON Log
+    ↓ (on-demand)
+Glue Crawler (schema discovery)
+    ↓
+Athena Table (queryable)
+    ↓
+SQL Query (cost per user/tenant/group)
+    ↓
+Chargeback Report
+```
+
+**Example Workflow:**
+```bash
+# 1. User makes API call
+curl -H "Authorization: Bearer $JWT" \
+     -H "Content-Type: application/json" \
+     -d '{"prompt":"What is AI?"}' \
+     https://api.example.com/invoke
+
+# 2. Lambda updates DynamoDB (atomic)
+tokens_used: 150000000 → 150000350 (+350)
+
+# 3. CloudWatch metric published
+MonthlyUsagePercent: 30.0%
+
+# 4. Dashboard shows updated gauge
+[████████░░░░] 30% (150M/500M)
+
+# 5. Athena query (end of month)
+john.doe@company.com | tenant_a | 150,000,350 tokens | $562.50
+```
+
+### Architectural Decisions
+
+#### Why Pre-Request Quota Enforcement?
+**Decision:** Check quota BEFORE calling Bedrock, not after.
+
+**Rationale:**
+- Saves cost (blocked requests don't consume Bedrock tokens)
+- Faster response to user (immediate quota error)
+- Prevents quota "overage" race conditions
+
+**Trade-off:** Adds 50-100ms latency for DynamoDB lookup.
+
+#### Why Server-Side requestMetadata?
+**Decision:** Lambda sets requestMetadata, not client.
+
+**Rationale:**
+- Cannot be spoofed by malicious clients
+- Ensures audit trail integrity
+- Compliance requirement (immutable logs)
+
+**Trade-off:** Requires Lambda proxy (cannot call Bedrock directly from client).
+
+#### Why Application Inference Profiles?
+**Decision:** Use AIPs for multi-tenant isolation.
+
+**Rationale:**
+- Automatic CloudWatch metrics per tenant
+- Cost allocation via AWS Cost Explorer tags
+- Rate limiting per tenant (if needed)
+- Model selection flexibility per tenant
+
+**Trade-off:** Requires creating/managing AIPs (AWS quota: 10 per region by default).
+
+#### Why DynamoDB Over RDS?
+**Decision:** Use DynamoDB for quota tracking.
+
+**Rationale:**
+- Atomic ADD operations (thread-safe)
+- Millisecond latency (50-100ms)
+- On-demand pricing (no idle costs)
+- Serverless (no patching/maintenance)
+
+**Trade-off:** Limited query capabilities (no complex JOINs).
+
+#### Why CloudWatch + Athena?
+**Decision:** Use CloudWatch for real-time, Athena for historical.
+
+**Rationale:**
+- CloudWatch: 1-2 min latency, great for dashboards
+- Athena: Cheap ($5/TB), great for monthly reports
+- Best of both worlds
+
+**Trade-off:** Two data sources to manage (but automated via Glue crawler).
 
 ## ✨ Key Features
 
