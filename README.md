@@ -15,7 +15,11 @@ This solution provides enterprise-grade monitoring and quota enforcement for Ama
 
 ## 📊 Live Dashboard
 
-![Dashboard Screenshot](https://via.placeholder.com/800x400?text=Bedrock+Multi-Tenant+Dashboard)
+<img width="2503" height="864" alt="image" src="https://github.com/user-attachments/assets/cb0ce39d-8ab2-442d-a223-8fedd78c4dd8" />
+
+
+<img width="2451" height="751" alt="image" src="https://github.com/user-attachments/assets/dd3c799b-53f5-41ce-8a36-3847dc4c724f" />
+
 
 **Features:**
 - Real-time tenant comparison (4 tenants)
